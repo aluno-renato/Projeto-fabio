@@ -1,0 +1,20 @@
+flowchart LR
+    A[Repositório local] --> B[Upload para S3]
+    B --> C[Orchestrator]
+    C --> D[SQS - fila de tarefas]
+    D --> E1[Worker 1]
+    D --> E2[Worker 2]
+    D --> E3[Worker N]
+    E1 --> F[Ollama / SLM]
+    E2 --> F
+    E3 --> F
+    E1 --> G[Resultados no S3]
+    E2 --> G
+    E3 --> G
+    D --> H[DLQ]
+    E1 --> I[Logs JSON]
+    E2 --> I
+    E3 --> I
+    I --> J[CloudWatch]
+    G --> K[_summary.json]
+    K --> L[Dashboard / Gráficos]

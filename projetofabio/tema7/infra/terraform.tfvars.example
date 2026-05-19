@@ -1,0 +1,3 @@
+bucket_name      = "tema7-seu-nome-unico"
+key_name         = "sua-chave-ssh"
+allowed_ssh_cidr = "SEU_IP_PUBLICO/32"
