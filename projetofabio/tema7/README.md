@@ -65,7 +65,7 @@ export AWS_DEFAULT_REGION="us-east-1"
 ### 3. Fazer upload do código a analisar
 
 ```bash
-bash scripts/upload_repo.sh /caminho/para/seu/repo
+bash scripts/upload_repo.sh https://github.com/aluno-renato/Projeto-fabio/tree/main
 ```
 
 ### 4. Subir os workers (em cada instância EC2)
@@ -74,7 +74,7 @@ bash scripts/upload_repo.sh /caminho/para/seu/repo
 # SSH na instância:
 ssh -i sua-chave.pem ec2-user@<IP>
 # Clonar o repositório e subir workers:
-git clone <seu-repo> && cd tema7
+git clone https://github.com/aluno-renato/Projeto-fabio/tree/main && cd tema7
 bash scripts/deploy_workers.sh 2 tests
 ```
 
