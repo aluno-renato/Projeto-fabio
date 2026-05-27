@@ -1,44 +1,52 @@
 {
   "agent": {
-    "metrics_collection_interval": 60,
+    "metrics_collection_interval": 30,
     "run_as_user": "root"
+  },
+  "metrics": {
+    "namespace": "Tema7/Infrastructure",
+    "metrics_collected": {
+      "cpu": {
+        "measurement": ["cpu_usage_idle", "cpu_usage_user", "cpu_usage_system"],
+        "metrics_collection_interval": 30,
+        "totalcpu": true
+      },
+      "mem": {
+        "measurement": ["mem_used_percent", "mem_available_mbytes"],
+        "metrics_collection_interval": 30
+      },
+      "disk": {
+        "measurement": ["used_percent"],
+        "resources": ["/"],
+        "metrics_collection_interval": 60
+      },
+      "net": {
+        "measurement": ["bytes_sent", "bytes_recv"],
+        "resources": ["eth0"],
+        "metrics_collection_interval": 30
+      }
+    },
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}",
+      "Project": "tema7"
+    }
   },
   "logs": {
     "logs_collected": {
       "files": {
         "collect_list": [
           {
-            "file_path": "/home/ec2-user/worker.log",
-            "log_group_name": "tema7-workers",
-            "log_stream_name": "worker-{instance_id}",
-            "timezone": "UTC"
-          },
-          {
-            "file_path": "/var/log/messages",
-            "log_group_name": "tema7-system",
-            "log_stream_name": "system-{instance_id}",
-            "timezone": "UTC"
+            "file_path": "/tmp/worker_*.log",
+            "log_group_name": "/tema7/workers",
+            "log_stream_name": "{instance_id}/worker",
+            "timezone": "UTC",
+            "multi_line_start_pattern": "\\{\"time\"",
+            "timestamp_format": "%Y-%m-%dT%H:%M:%S"
           }
         ]
       }
-    }
-  },
-  "metrics": {
-    "namespace": "Tema7/Workers",
-    "metrics_collected": {
-      "cpu": {
-        "measurement": ["cpu_usage_idle", "cpu_usage_user", "cpu_usage_system"],
-        "metrics_collection_interval": 60
-      },
-      "mem": {
-        "measurement": ["mem_used_percent"],
-        "metrics_collection_interval": 60
-      },
-      "disk": {
-        "measurement": ["used_percent"],
-        "metrics_collection_interval": 60,
-        "resources": ["/"]
-      }
-    }
+    },
+    "log_stream_name": "{instance_id}",
+    "force_flush_interval": 15
   }
 }

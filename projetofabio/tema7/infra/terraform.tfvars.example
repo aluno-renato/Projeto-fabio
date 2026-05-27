@@ -1,3 +1,8 @@
-bucket_name      = "tema7-seu-nome-unico"
-key_name         = "sua-chave-ssh"
-allowed_ssh_cidr = "SEU_IP_PUBLICO/32"
+# Copie este arquivo para terraform.tfvars e preencha os valores
+bucket_name      = "tema7-codigo-SEU_NOME"
+key_name         = "minha-chave-ec2"
+worker_count     = 2          # aumente para medir escala (1, 2, 4)
+instance_type    = "t3.large" # ou g4dn.xlarge para GPU
+ollama_model     = "mistral"  # ou llama3.2, gemma3:2b
+allowed_ssh_cidr = "0.0.0.0/0"
+aws_region       = "us-east-1"

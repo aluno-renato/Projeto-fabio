@@ -1,6 +1,12 @@
 """
 Worker do Tema 7 — consome tarefas da fila SQS, chama o Ollama e salva no S3.
 Execute com: python worker.py --worker-id 1
+
+Ajustes v1.1:
+- Memória entre chunks: resumo do chunk anterior é injetado no prompt seguinte
+- Métricas customizadas de negócio enviadas ao CloudWatch (latência, tokens, erros)
+- Taxa de erro coletada e publicada por worker
+- Fallback documentado e tratado no nível do loop principal
 """
 
 import argparse
@@ -17,13 +23,15 @@ import requests
 from botocore.exceptions import ClientError
 
 # ─── Configuração via variáveis de ambiente ───────────────────────────────────
-SQS_QUEUE_URL  = os.environ["SQS_QUEUE_URL"]         # URL da fila de tarefas
-SQS_DLQ_URL    = os.environ.get("SQS_DLQ_URL", "")   # Dead Letter Queue (opcional manual)
-S3_BUCKET      = os.environ["S3_BUCKET"]              # Bucket para resultados
+SQS_QUEUE_URL  = os.environ["SQS_QUEUE_URL"]
+SQS_DLQ_URL    = os.environ.get("SQS_DLQ_URL", "")
+S3_BUCKET      = os.environ["S3_BUCKET"]
 OLLAMA_HOST    = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL", "mistral")
 MAX_RETRIES    = int(os.environ.get("MAX_RETRIES", "3"))
-BACKOFF_BASE   = float(os.environ.get("BACKOFF_BASE", "2.0"))  # segundos
+BACKOFF_BASE   = float(os.environ.get("BACKOFF_BASE", "2.0"))
+CW_NAMESPACE   = os.environ.get("CW_NAMESPACE", "Tema7/Workers")
+AWS_REGION     = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
 # ─── Logging estruturado ──────────────────────────────────────────────────────
 logging.basicConfig(
@@ -41,6 +49,24 @@ def get_logger(worker_id: str):
         return record
     logging.setLogRecordFactory(record_factory)
     return logger
+
+
+# ─── CloudWatch: métricas customizadas de negócio ────────────────────────────
+def put_metric(cw_client, metric_name: str, value: float, unit: str, worker_id: str):
+    """Publica uma métrica customizada no CloudWatch."""
+    try:
+        cw_client.put_metric_data(
+            Namespace=CW_NAMESPACE,
+            MetricData=[{
+                "MetricName": metric_name,
+                "Value": value,
+                "Unit": unit,
+                "Dimensions": [{"Name": "WorkerId", "Value": worker_id}],
+            }],
+        )
+    except Exception as exc:
+        # Falha em métrica não deve derrubar o worker
+        pass
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -74,8 +100,8 @@ def call_ollama(system_prompt: str, user_content: str, logger) -> dict:
             latency = time.perf_counter() - t0
 
             text = data["message"]["content"]
-            eval_count = data.get("eval_count", 0)          # tokens gerados
-            prompt_eval = data.get("prompt_eval_count", 0)  # tokens do prompt
+            eval_count   = data.get("eval_count", 0)
+            prompt_eval  = data.get("prompt_eval_count", 0)
 
             logger.info(json.dumps({
                 "event": "ollama_ok",
@@ -104,10 +130,10 @@ def call_ollama(system_prompt: str, user_content: str, logger) -> dict:
             time.sleep(wait)
 
 
-def chunk_code(code: str, max_chars: int = 6000) -> list[str]:
+def chunk_code(code: str, max_chars: int = 6000) -> list:
     """
     Divide arquivos grandes em chunks por número de caracteres,
-    tentando cortar em limites de linha para não quebrar no meio de uma função.
+    cortando em limites de linha para não quebrar no meio de uma função.
     """
     if len(code) <= max_chars:
         return [code]
@@ -125,30 +151,85 @@ def chunk_code(code: str, max_chars: int = 6000) -> list[str]:
     return chunks
 
 
-def process_file(task: dict, logger) -> dict:
-    """Processa um arquivo de código: gera testes, smells e documentação."""
-    file_key   = task["file_key"]    # ex: "repo/src/utils.py"
-    language   = task.get("language", "python")
-    mode       = task.get("mode", "tests")  # tests | smells | docs
+def summarize_output(text: str, max_chars: int = 800) -> str:
+    """
+    Extrai um resumo compacto da saída do chunk anterior para usar como
+    contexto de memória no próximo chunk. Evita duplicação de testes/smells.
+    Trunca para não inflar o prompt desnecessariamente.
+    """
+    lines = text.strip().splitlines()
+    # Para smells (JSON array), extrai nomes dos smells encontrados
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            names = [item.get("smell", "") for item in parsed if isinstance(item, dict)]
+            return f"Smells já identificados no chunk anterior: {', '.join(names[:10])}"
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Para testes/docs: pega as primeiras linhas significativas
+    summary_lines = [l for l in lines if l.strip() and not l.strip().startswith("#")][:12]
+    summary = "\n".join(summary_lines)
+    if len(summary) > max_chars:
+        summary = summary[:max_chars] + "\n[... truncado ...]"
+    return summary
+
+
+def process_file(task: dict, logger, cw_client, worker_id: str) -> dict:
+    """Processa um arquivo de código: gera testes, smells ou documentação."""
+    file_key = task["file_key"]
+    language = task.get("language", "python")
+    mode     = task.get("mode", "tests")
 
     # Baixa o arquivo do S3
-    s3 = boto3.client("s3")
+    s3  = boto3.client("s3")
     obj = s3.get_object(Bucket=S3_BUCKET, Key=file_key)
     code = obj["Body"].read().decode("utf-8")
 
     system_prompt = load_prompt(f"{mode}_{language}")
     chunks = chunk_code(code)
 
-    results, total_tokens_prompt, total_tokens_gen, total_latency = [], 0, 0, 0.0
+    results = []
+    total_tokens_prompt = 0
+    total_tokens_gen    = 0
+    total_latency       = 0.0
+    previous_summary    = ""   # memória entre chunks
 
     for i, chunk in enumerate(chunks):
-        logger.info(json.dumps({"event": "chunk_start", "chunk": i+1, "total": len(chunks)}))
-        user_content = f"Arquivo: {file_key}\nChunk {i+1}/{len(chunks)}:\n\n```{language}\n{chunk}\n```"
+        logger.info(json.dumps({"event": "chunk_start", "chunk": i + 1, "total": len(chunks)}))
+
+        # Monta o conteúdo do usuário injetando contexto do chunk anterior
+        if previous_summary:
+            context_note = (
+                f"\n\n[CONTEXTO DO CHUNK ANTERIOR — não repita o que já foi gerado]\n"
+                f"{previous_summary}\n"
+                f"[FIM DO CONTEXTO]\n"
+            )
+        else:
+            context_note = ""
+
+        user_content = (
+            f"Arquivo: {file_key}\n"
+            f"Chunk {i + 1}/{len(chunks)}:\n"
+            f"{context_note}"
+            f"\n```{language}\n{chunk}\n```"
+        )
+
         result = call_ollama(system_prompt, user_content, logger)
         results.append(result["text"])
+
+        # Atualiza memória para o próximo chunk
+        previous_summary = summarize_output(result["text"])
+
         total_tokens_prompt += result["tokens_prompt"]
         total_tokens_gen    += result["tokens_gen"]
         total_latency       += result["latency_s"]
+
+    # Publica métricas de negócio no CloudWatch
+    put_metric(cw_client, "LatencyPerFile",    total_latency,       "Seconds", worker_id)
+    put_metric(cw_client, "TokensGenerated",   total_tokens_gen,    "Count",   worker_id)
+    put_metric(cw_client, "TokensPrompt",      total_tokens_prompt, "Count",   worker_id)
+    put_metric(cw_client, "FilesProcessed",    1,                   "Count",   worker_id)
+    put_metric(cw_client, "ChunksProcessed",   len(chunks),         "Count",   worker_id)
 
     combined_output = "\n\n---\n\n".join(results)
 
@@ -180,9 +261,13 @@ def save_result(result: dict, logger):
 
 # ─── Loop principal ───────────────────────────────────────────────────────────
 def run(worker_id: str):
-    logger = get_logger(worker_id)
-    sqs = boto3.client("sqs")
+    logger   = get_logger(worker_id)
+    sqs      = boto3.client("sqs", region_name=AWS_REGION)
+    cw_client = boto3.client("cloudwatch", region_name=AWS_REGION)
+
     logger.info(json.dumps({"event": "start", "model": OLLAMA_MODEL, "queue": SQS_QUEUE_URL}))
+
+    consecutive_errors = 0
 
     while True:
         # Long-poll para reduzir chamadas vazias
@@ -196,24 +281,50 @@ def run(worker_id: str):
         if not messages:
             continue
 
-        msg = messages[0]
+        msg     = messages[0]
         receipt = msg["ReceiptHandle"]
-        task = json.loads(msg["Body"])
+        task    = json.loads(msg["Body"])
         receive_count = int(msg["Attributes"].get("ApproximateReceiveCount", 1))
 
         logger.info(json.dumps({"event": "task_received", "task": task, "receive_count": receive_count}))
 
         try:
-            result = process_file(task, logger)
+            result = process_file(task, logger, cw_client, worker_id)
             save_result(result, logger)
-            # Mensagem processada com sucesso → deleta da fila
             sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt)
             logger.info(json.dumps({"event": "task_done", "file": task.get("file_key")}))
+            consecutive_errors = 0
+
+        except requests.exceptions.ConnectionError as exc:
+            # ── FALLBACK: Ollama inacessível ──────────────────────────────────
+            # Estratégia: loga o erro, publica métrica de falha, NÃO deleta a
+            # mensagem (SQS recoloca na fila). Após 3 falhas consecutivas o
+            # worker dorme 60s antes de tentar novamente, evitando loop frenético.
+            # Após maxReceiveCount=3 a mensagem vai automaticamente para a DLQ.
+            consecutive_errors += 1
+            put_metric(cw_client, "OllamaErrors", 1, "Count", worker_id)
+            logger.error(json.dumps({
+                "event":             "ollama_unreachable",
+                "error":             str(exc),
+                "consecutive_errors": consecutive_errors,
+                "fallback_action":   "message_not_deleted_will_retry_via_sqs",
+            }))
+            if consecutive_errors >= 3:
+                logger.warning(json.dumps({
+                    "event":   "fallback_cooling_down",
+                    "sleep_s": 60,
+                    "reason":  "3 consecutive Ollama failures — waiting before retry",
+                }))
+                time.sleep(60)
 
         except Exception as exc:
-            logger.error(json.dumps({"event": "task_error", "error": str(exc), "trace": traceback.format_exc()}))
-            # Não deleta → SQS vai recolocar na fila até o maxReceiveCount configurado
-            # depois vai para a DLQ automaticamente (configure no console)
+            # Erros genéricos (S3, parsing, etc.): loga e não deleta
+            put_metric(cw_client, "ProcessingErrors", 1, "Count", worker_id)
+            logger.error(json.dumps({
+                "event": "task_error",
+                "error": str(exc),
+                "trace": traceback.format_exc(),
+            }))
 
 
 if __name__ == "__main__":

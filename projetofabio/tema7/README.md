@@ -13,108 +13,146 @@ agrega os resultados via S3.
       ▼
 [SQS Queue] ──────────────────────────────────────┐
       │                                            │
-[Worker EC2 #1]                           [Worker EC2 #2]
+[Worker EC2 #1]                           [Worker EC2 #2..N]
   consome msg                               consome msg
   baixa código S3                           baixa código S3
   chama Ollama (localhost)                  chama Ollama (localhost)
+  chunking + memória entre chunks           chunking + memória entre chunks
   salva resultado S3                        salva resultado S3
+  publica métricas CloudWatch               publica métricas CloudWatch
       │                                            │
       └─────────────────┬──────────────────────────┘
                         ▼
-              [S3 results/] ← Orquestrador agrega e salva _summary.json
+              [S3 results/] ← Orquestrador agrega, calcula taxa de erro,
+                               lê DLQ, salva _summary.json e publica no CW
 ```
 
-**Componentes AWS usados:** EC2, SQS (+ DLQ automática), S3, CloudWatch (logs via
-stdout → CloudWatch Agent ou journald).
+**Componentes AWS:** EC2 (N workers via Terraform `worker_count`), SQS + DLQ
+automática, S3, CloudWatch (logs + métricas customizadas + alarme de DLQ).
 
 ## Pré-requisitos
 
 - AWS CLI configurado com credenciais do Academy
 - Python 3.10+
-- Ollama instalado nas instâncias EC2 workers
+- Terraform >= 1.5 (para provisionamento)
 
 ## Setup Rápido
 
-### 1. Criar recursos AWS (manual ou via console)
-
-- **SQS:** crie uma fila padrão chamada `tema7-tasks`. Configure uma DLQ chamada
-  `tema7-dlq` com `maxReceiveCount=3`.
-- **S3:** crie um bucket, ex: `tema7-codigo-SEU_NOME`.
-- **EC2:** suba 2 instâncias `t3.large` (CPU) ou `g4dn.xlarge` (GPU) com Amazon
-  Linux 2023. Associe uma IAM Role com permissões de SQS e S3.
-
-### 2. Definir variáveis de ambiente (em cada instância EC2)
+### 1. Provisionar infraestrutura com Terraform
 
 ```bash
-export SQS_QUEUE_URL="https://sqs.us-east-1.amazonaws.com/123456789/tema7-tasks"
-export SQS_DLQ_URL="https://sqs.us-east-1.amazonaws.com/123456789/tema7-dlq"
-export S3_BUCKET="tema7-codigo-SEU_NOME"
-export OLLAMA_MODEL="mistral"   # ou llama3.2, gemma3:2b, etc.
+cd infra/
+cp terraform.tfvars.example terraform.tfvars
+# edite terraform.tfvars: bucket_name, key_name, worker_count
+terraform init
+terraform apply
+```
+
+O Terraform cria: S3, SQS, DLQ, IAM Role, Security Group e `worker_count` instâncias
+EC2. Cada instância já instala Ollama e baixa o modelo automaticamente via user_data.
+
+### 2. Exportar variáveis de ambiente
+
+```bash
+# Use os outputs do terraform apply:
+export SQS_QUEUE_URL=$(terraform -chdir=infra output -raw sqs_queue_url)
+export SQS_DLQ_URL=$(terraform -chdir=infra output -raw dlq_url)
+export S3_BUCKET=$(terraform -chdir=infra output -raw s3_bucket)
+export OLLAMA_MODEL="mistral"
 export AWS_DEFAULT_REGION="us-east-1"
 ```
 
-### 3. Instalar dependências
-
-```bash
-pip install boto3 requests
-```
-
-### 4. Fazer upload do código a analisar
+### 3. Fazer upload do código a analisar
 
 ```bash
 bash scripts/upload_repo.sh /caminho/para/seu/repo
 ```
 
-### 5. Subir os workers
+### 4. Subir os workers (em cada instância EC2)
 
 ```bash
-# Em cada instância EC2:
+# SSH na instância:
+ssh -i sua-chave.pem ec2-user@<IP>
+# Clonar o repositório e subir workers:
+git clone <seu-repo> && cd tema7
 bash scripts/deploy_workers.sh 2 tests
 ```
 
-### 6. Rodar o orquestrador (pode ser na mesma máquina ou no seu PC)
+### 5. Rodar o orquestrador
 
 ```bash
 python orchestrator/orchestrator.py --prefix repo/ --mode tests
 ```
 
-O orquestrador aguarda os resultados e salva `results/_summary.json` no S3.
+O orquestrador aguarda os resultados, lê a DLQ para calcular taxa de erro real,
+publica métricas no CloudWatch e salva `results/_summary.json` no S3.
+
+### 6. Gerar gráficos
+
+```bash
+# A partir do S3 (após execução real):
+python dashboard/generate_metrics_charts.py --from-s3
+
+# Para análise de escala (múltiplos runs com N workers diferentes):
+python dashboard/generate_metrics_charts.py --multi-run run_1w.json run_2w.json run_4w.json
+```
 
 ## Modos disponíveis
 
-| Modo     | Descrição                                      |
-|----------|------------------------------------------------|
-| `tests`  | Gera testes unitários pytest                   |
-| `smells` | Detecta code smells (saída JSON)               |
-| `docs`   | Adiciona docstrings Google-style ao código     |
+| Modo     | Descrição                                          |
+|----------|----------------------------------------------------|
+| `tests`  | Gera testes unitários (pytest / Jest)              |
+| `smells` | Detecta code smells (saída JSON estruturada)       |
+| `docs`   | Adiciona docstrings/JSDoc ao código                |
+
+## Linguagens suportadas
+
+Python, JavaScript, TypeScript, Java, Go, Ruby, C++, C.
 
 ## Prompts versionados
 
-Todos os system prompts ficam em `prompts/`. Cada arquivo tem cabeçalho com versão.
-Para mudar o comportamento do modelo, edite o arquivo correspondente e incremente
-a versão — **não altere o código Python**.
+Todos os system prompts ficam em `prompts/`. Cada arquivo tem cabeçalho com versão
+e modo. Para mudar o comportamento do modelo, edite o arquivo e incremente a versão
+no cabeçalho — **nunca altere o código Python para mudar comportamento do LLM**.
+Consulte `prompts/CHANGELOG_PROMPTS.md` para o histórico completo.
 
-## Tolerância a falhas
+## Memória entre chunks
 
-- **Retry com backoff:** o worker tenta até `MAX_RETRIES=3` vezes com espera
-  exponencial (`2^tentativa` segundos) antes de desistir.
-- **DLQ:** mensagens que falharam 3 vezes são movidas automaticamente para
-  `tema7-dlq` pelo SQS. Inspecione com `aws sqs receive-message --queue-url $SQS_DLQ_URL`.
-- **Fallback:** se o Ollama estiver fora, o worker loga o erro e não deleta a
-  mensagem, que será reprocessada por outro worker.
+Quando um arquivo é maior que 6.000 caracteres, o worker o divide em chunks.
+Para evitar que o modelo gere testes/smells duplicados entre chunks, a saída
+de cada chunk é resumida e injetada como contexto no prompt do chunk seguinte:
 
-## O que falta implementar (para seu parceiro)
+```
+[CONTEXTO DO CHUNK ANTERIOR — não repita o que já foi gerado]
+<resumo compacto da saída anterior>
+[FIM DO CONTEXTO]
+```
 
-- [ ] Terraform / CloudFormation para criar SQS + S3 + IAM Role
-- [ ] CloudWatch Agent para coletar logs estruturados das instâncias
-- [ ] Dashboard CloudWatch com latência, throughput e tokens consumidos
-- [ ] Prompts para outras linguagens (JavaScript, Java etc.) — copie o padrão de `tests_python.txt`
-- [ ] Script de coleta de métricas que lê `_summary.json` e gera gráficos (matplotlib)
-- [ ] Relatório técnico com os resultados experimentais
+## Tolerância a Falhas
+
+| Ponto crítico           | Estratégia                                                          |
+|-------------------------|---------------------------------------------------------------------|
+| Ollama inacessível      | Retry com backoff `2^n` s (até MAX_RETRIES=3) → não deleta msg → SQS recoloca |
+| 3 falhas consecutivas   | Worker dorme 60s (cooling down) antes de tentar próxima mensagem   |
+| Mensagem falha 3× total | SQS move automaticamente para DLQ (maxReceiveCount=3)              |
+| DLQ com mensagens       | CloudWatch Alarm dispara (criado pelo Terraform)                    |
+| Fallback documentado    | Operador inspeciona DLQ, reinspeciona logs e decide reprocessar     |
+
+## Métricas coletadas
+
+| Métrica                  | Origem          | Namespace CloudWatch     |
+|--------------------------|-----------------|--------------------------|
+| Latência por arquivo (s) | Worker → CW     | Tema7/Workers            |
+| Tokens gerados           | Worker → CW     | Tema7/Workers            |
+| Tokens de prompt         | Worker → CW     | Tema7/Workers            |
+| Arquivos processados     | Worker → CW     | Tema7/Workers            |
+| Erros de Ollama          | Worker → CW     | Tema7/Workers            |
+| Taxa de erro (%)         | Orchestrator→CW | Tema7/Workers            |
+| Throughput (arq/min)     | Orchestrator→CW | Tema7/Workers            |
+| Msgs na DLQ              | SQS nativo      | AWS/SQS                  |
+| CPU/Mem/Disco            | CW Agent        | Tema7/Infrastructure     |
 
 ## Testando localmente (sem AWS)
-
-Você pode rodar o worker apontando para filas/buckets locais com LocalStack:
 
 ```bash
 pip install localstack awscli-local
