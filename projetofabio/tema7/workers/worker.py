@@ -1,13 +1,4 @@
-"""
-Worker do Tema 7 — consome tarefas da fila SQS, chama o Ollama e salva no S3.
-Execute com: python worker.py --worker-id 1
 
-Ajustes v1.1:
-- Memória entre chunks: resumo do chunk anterior é injetado no prompt seguinte
-- Métricas customizadas de negócio enviadas ao CloudWatch (latência, tokens, erros)
-- Taxa de erro coletada e publicada por worker
-- Fallback documentado e tratado no nível do loop principal
-"""
 
 import argparse
 import json
@@ -22,7 +13,7 @@ import boto3
 import requests
 from botocore.exceptions import ClientError
 
-# ─── Configuração via variáveis de ambiente ───────────────────────────────────
+
 SQS_QUEUE_URL  = os.environ["SQS_QUEUE_URL"]
 SQS_DLQ_URL    = os.environ.get("SQS_DLQ_URL", "")
 S3_BUCKET      = os.environ["S3_BUCKET"]
@@ -33,7 +24,7 @@ BACKOFF_BASE   = float(os.environ.get("BACKOFF_BASE", "2.0"))
 CW_NAMESPACE   = os.environ.get("CW_NAMESPACE", "Tema7/Workers")
 AWS_REGION     = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
-# ─── Logging estruturado ──────────────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
     format='{"time":"%(asctime)s","level":"%(levelname)s","worker":"%(worker_id)s","msg":%(message)s}',
@@ -69,7 +60,7 @@ def put_metric(cw_client, metric_name: str, value: float, unit: str, worker_id: 
         pass
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 def load_prompt(name: str) -> str:
