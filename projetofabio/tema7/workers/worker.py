@@ -287,11 +287,7 @@ def run(worker_id: str):
             consecutive_errors = 0
 
         except requests.exceptions.ConnectionError as exc:
-            # ── FALLBACK: Ollama inacessível ──────────────────────────────────
-            # Estratégia: loga o erro, publica métrica de falha, NÃO deleta a
-            # mensagem (SQS recoloca na fila). Após 3 falhas consecutivas o
-            # worker dorme 60s antes de tentar novamente, evitando loop frenético.
-            # Após maxReceiveCount=3 a mensagem vai automaticamente para a DLQ.
+
             consecutive_errors += 1
             put_metric(cw_client, "OllamaErrors", 1, "Count", worker_id)
             logger.error(json.dumps({
