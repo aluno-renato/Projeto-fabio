@@ -1,6 +1,4 @@
-# sample_code/calculator.py
-# Arquivo de exemplo para testar o pipeline.
-# Faça upload para S3 com: bash scripts/upload_repo.sh sample_code/
+
 
 def add(a, b):
     return a + b
