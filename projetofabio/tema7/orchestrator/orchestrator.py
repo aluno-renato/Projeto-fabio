@@ -1,13 +1,4 @@
-"""
-Orquestrador — varre o S3 em busca de arquivos de código e enfileira tarefas no SQS.
-Execute com: python orchestrator.py --mode tests --prefix repo/src/
 
-Ajustes v1.1:
-- Agrega taxa de erro lendo contagem de mensagens na DLQ
-- Calcula throughput real com base em tempo de execução medido
-- Emite métricas agregadas no CloudWatch
-- Salva _summary.json com campos completos que o dashboard consome
-"""
 
 import argparse
 import json
